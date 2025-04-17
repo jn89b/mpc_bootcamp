@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -62,12 +63,22 @@ class ToyCar(CasadiModel):
                                     [self.z_dot])
 
 
+@dataclass
+class Obstacle:
+    center: Tuple[float, float]
+    radius: float
+
+
 class CarOptimalControl(OptimalControlProblem):
     def __init__(self,
                  mpc_params: MPCParams,
-                 casadi_model: CasadiModel) -> None:
+                 casadi_model: CasadiModel,
+                 obs_params: List[Obstacle]) -> None:
         super().__init__(mpc_params,
                          casadi_model)
+        self.obs_params: List[Obstacle] = obs_params
+        self.robot_radius: float = 3.0
+        self.set_obstacle_avoidance_constraints()
 
     def compute_dynamics_cost(self) -> ca.MX:
         """
@@ -89,9 +100,86 @@ class CarOptimalControl(OptimalControlProblem):
 
         return cost
 
+    def set_obstacle_avoidance_constraints(self) -> None:
+        """
+        Set the obstacle avoidance constraints for the optimal control problem
+        """
+        x_position = self.X[0, :]
+        y_position = self.X[1, :]
+
+        for i, obs in enumerate(self.obs_params):
+            obs_center: Tuple[float] = ca.DM(obs.center)
+            obs_radius: float = obs.radius
+            distance = -ca.sqrt((x_position - obs_center[0])**2 +
+                                (y_position - obs_center[1])**2)
+            diff = distance + obs_radius + self.robot_radius
+            self.g = ca.vertcat(self.g, diff[:-1].T)
+
     def compute_total_cost(self) -> ca.MX:
         cost = self.compute_dynamics_cost()
         return cost
+
+    def solve(self, x0: np.ndarray, xF: np.ndarray, u0: np.ndarray) -> np.ndarray:
+        """
+        Solve the optimal control problem for the given initial state and control
+
+        """
+        state_init = ca.DM(x0)
+        state_final = ca.DM(xF)
+
+        X0 = ca.repmat(state_init, 1, self.N+1)
+        U0 = ca.repmat(u0, 1, self.N)
+
+        n_states = self.casadi_model.n_states
+        n_controls = self.casadi_model.n_controls
+        # self.compute_obstacle_avoidance_cost()
+
+        # set the obstacle avoidance constraints
+        num_obstacles = len(self.obs_params)  # + 1
+        num_obstacle_constraints = num_obstacles * (self.N)
+        # Constraints for lower and upp bound for state constraints
+        # First handle state constraints
+        lbg_states = ca.DM.zeros((n_states*(self.N+1), 1))
+        ubg_states = ca.DM.zeros((n_states*(self.N+1), 1))
+
+        # Now handle the obstacle avoidance constraints and add them at the bottom
+        # Obstacles' lower bound constraints (-inf)
+        # this is set up where -distance + radius <= 0
+        lbg_obs = ca.DM.zeros((num_obstacle_constraints, 1))
+        lbg_obs[:] = -ca.inf
+        ubg_obs = ca.DM.zeros((num_obstacle_constraints, 1))
+        # Concatenate state constraints and obstacle constraints (state constraints come first)
+        # Concatenate state constraints and then obstacle constraints
+        lbg = ca.vertcat(lbg_states, lbg_obs)
+        ubg = ca.vertcat(ubg_states, ubg_obs)  # Same for the upper bounds
+
+        args = {
+            'lbg': lbg,  # dynamic constraints and path constraint
+            'ubg': ubg,
+            # state and control constriaints
+            'lbx': self.pack_variables_fn(**self.lbx)['flat'],
+            'ubx': self.pack_variables_fn(**self.ubx)['flat'],
+        }
+        args['p'] = ca.vertcat(
+            state_init,    # current state
+            state_final   # target state
+        )
+
+        args['x0'] = ca.vertcat(
+            ca.reshape(X0, n_states*(self.N+1), 1),
+            ca.reshape(U0, n_controls*self.N, 1)
+        )
+        # init_time = time.time()
+        solution = self.solver(
+            x0=args['x0'],
+            lbx=args['lbx'],
+            ubx=args['ubx'],
+            lbg=args['lbg'],
+            ubg=args['ubg'],
+            p=args['p']
+        )
+
+        return solution
 
 
 toycar = ToyCar()
@@ -105,7 +193,7 @@ state_limits_dict: dict = {
 }
 control_limits_dict: dict = {
     'u_vel':
-        {'min': 0, 'max': 10},
+        {'min': 0.5, 'max': 10},
     'u_psi':
         {'min': -np.deg2rad(20), 'max': np.deg2rad(20)},
 }
@@ -114,10 +202,14 @@ toycar.set_state_limits(state_limits_dict)
 
 Q: np.diag = np.diag([1, 1, 0])
 R: np.diag = np.diag([1, 1])
+obstacle_list: List[Obstacle] = []
+obstacle_list.append(Obstacle(center=[50, 50, 20], radius=5))
+obstacle_list.append(Obstacle(center=[70, 70, 20], radius=10))
 # we will now slot the MPC weights into the MPCParams class
 mpc_params: MPCParams = MPCParams(Q=Q, R=R, N=15, dt=0.1)
 car_opt_control: CarOptimalControl = CarOptimalControl(
-    mpc_params=mpc_params, casadi_model=toycar
+    mpc_params=mpc_params, casadi_model=toycar,
+    obs_params=obstacle_list
 )
 
 # Now we set our initial conditions
@@ -127,7 +219,7 @@ x0: np.array = np.array([-10,  # x
 
 xF: np.array = np.array(
     [100,
-     -100,
+     100,
      np.deg2rad(45)]
 )
 u_0: np.array = np.array([0, 0])
